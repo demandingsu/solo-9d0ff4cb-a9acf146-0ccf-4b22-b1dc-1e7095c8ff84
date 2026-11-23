@@ -103,4 +103,40 @@ s, r = call("POST", "/flows/import",
 assert s == 422
 print("9. 金额为负返回 422 校验错误")
 
+# 9. 到账时效明细分页（按付款日、划款号；本轮固定批次续读）
+s, r = call("POST", "/flows/import", {"flows": [
+    f("C01", 1, "Q1", "2026-09-05", "pay", 5_000),
+    f("C02", 1, "Q1", "2026-09-24", "receive", 5_000),
+    f("C03", 1, "Q2", "2026-09-06", "pay", 8_000),
+    f("C04", 1, "Q2", "2026-09-20", "receive", 3_000),
+]})
+assert s == 201 and r["timing"]["recomputed"] == 2, r
+
+s, page1 = call("GET", "/timing-details?page_size=1")
+assert s == 200 and len(page1["items"]) == 1 and page1["has_more"], page1
+assert page1["total_count"] == 3, page1
+first_as_of = page1["as_of"]
+seen = [page1["items"][0]["transfer_no"]]
+cur = page1["next_cursor"]
+while cur:
+    s, nxt = call("GET",
+                  f"/timing-details?page_size=1&as_of={first_as_of}&cursor={cur}")
+    assert s == 200 and nxt["as_of"] == first_as_of, nxt
+    seen += [x["transfer_no"] for x in nxt["items"]]
+    cur = nxt["next_cursor"]
+assert seen == ["P1", "Q1", "Q2"], seen
+print("10. 到账时效分页续读：", seen, "固定批次", first_as_of)
+
+# 10. 翻页中途新增到账：旧批次续读结论不变，最新批次更新
+s, _ = call("POST", "/flows/import", {"flows": [
+    f("C05", 1, "Q2", "2026-09-26", "receive", 5_000)]})
+s, old = call("GET", f"/timing-details?as_of={first_as_of}&payment_month=2026-09")
+q2_old = next(x for x in old["items"] if x["transfer_no"] == "Q2")
+s, new = call("GET", "/timing-details?payment_month=2026-09")
+q2_new = next(x for x in new["items"] if x["transfer_no"] == "Q2")
+assert q2_old["status"] == "outstanding" and q2_old["outstanding_cents"] == 5_000, q2_old
+assert q2_new["status"] == "settled" and q2_new["settled_date"] == "2026-09-26", q2_new
+print("11. 旧批次 Q2 未足额", q2_old["outstanding_cents"],
+      "-> 最新批次结清日", q2_new["settled_date"])
+
 print("\nHTTP 冒烟全部通过")

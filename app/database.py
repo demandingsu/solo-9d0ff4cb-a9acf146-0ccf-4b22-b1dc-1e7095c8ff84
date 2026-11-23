@@ -2,13 +2,15 @@
 from __future__ import annotations
 
 import calendar
+import json
 import sqlite3
 import uuid
 from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator
 
+from . import compute
 from .config import DB_PATH, DIRECTIONS
 
 SCHEMA = """
@@ -72,6 +74,53 @@ CREATE TABLE IF NOT EXISTS paper_flow_evidence (
     amount_cents   INTEGER NOT NULL,
     PRIMARY KEY (paper_id, flow_no)
 );
+
+CREATE TABLE IF NOT EXISTS app_meta (
+    key    TEXT PRIMARY KEY,
+    value  TEXT NOT NULL
+);
+
+-- 到账时效明细：当前有效结论，录入批次与流水在同一事务内更新
+CREATE TABLE IF NOT EXISTS timing_details (
+    transfer_no        TEXT PRIMARY KEY,
+    payment_month      TEXT NOT NULL,
+    payment_date       TEXT NOT NULL,
+    payment_flow_no    TEXT NOT NULL,
+    payment_revision   INTEGER NOT NULL,
+    paid_cents         INTEGER NOT NULL,
+    received_cents     INTEGER NOT NULL,
+    status             TEXT NOT NULL,
+    settled_date       TEXT,
+    outstanding_cents  INTEGER,
+    pending_reasons    TEXT NOT NULL,
+    receipt_flows      TEXT NOT NULL,
+    updated_batch_id   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_timing_details_month
+    ON timing_details(payment_month, payment_date, transfer_no);
+
+-- 明细逐批次版本：分页固定到首页所见的批次，重试/重启后仍按该版本续读
+CREATE TABLE IF NOT EXISTS timing_detail_history (
+    batch_id          INTEGER NOT NULL,
+    transfer_no       TEXT NOT NULL,
+    is_present        INTEGER NOT NULL CHECK (is_present IN (0, 1)),
+    payment_month     TEXT,
+    payment_date      TEXT,
+    payment_flow_no   TEXT,
+    payment_revision  INTEGER,
+    paid_cents        INTEGER,
+    received_cents    INTEGER,
+    status            TEXT,
+    settled_date      TEXT,
+    outstanding_cents INTEGER,
+    pending_reasons   TEXT,
+    receipt_flows     TEXT,
+    PRIMARY KEY (batch_id, transfer_no)
+);
+CREATE INDEX IF NOT EXISTS idx_timing_history_transfer
+    ON timing_detail_history(transfer_no, batch_id);
+CREATE INDEX IF NOT EXISTS idx_timing_history_batch
+    ON timing_detail_history(batch_id);
 """
 
 
@@ -81,6 +130,9 @@ class ConflictError(Exception):
 
 class NotFoundError(Exception):
     """封存底稿不存在等 404 场景。"""
+
+
+TIMING_SCHEMA_VERSION = "1"
 
 
 def connect(db_path: Path | str | None = None) -> sqlite3.Connection:
@@ -100,8 +152,312 @@ def init_db(db_path: Path | str | None = None) -> None:
     conn = connect(db_path)
     try:
         conn.executescript(SCHEMA)
+        ensure_timing_details(conn)
     finally:
         conn.close()
+
+
+# ---------------- 到账时效明细维护 ----------------
+
+def _detail_row(detail: dict[str, Any], batch_id: int) -> tuple[Any, ...]:
+    return (
+        detail["transfer_no"],
+        detail["payment_month"],
+        detail["payment_date"],
+        detail["payment_flow_no"],
+        detail["payment_revision"],
+        detail["paid_cents"],
+        detail["received_cents"],
+        detail["status"],
+        detail["settled_date"],
+        detail["outstanding_cents"],
+        json.dumps(detail["pending_reasons"], ensure_ascii=False),
+        json.dumps(detail["receipt_flows"], ensure_ascii=False),
+        batch_id,
+    )
+
+
+_DETAIL_INSERT_SQL = (
+    "INSERT INTO timing_details(transfer_no, payment_month, payment_date, "
+    "payment_flow_no, payment_revision, paid_cents, received_cents, status, "
+    "settled_date, outstanding_cents, pending_reasons, receipt_flows, "
+    "updated_batch_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)"
+)
+
+_HISTORY_INSERT_SQL = (
+    "INSERT INTO timing_detail_history(batch_id, transfer_no, is_present, "
+    "payment_month, payment_date, payment_flow_no, payment_revision, paid_cents, "
+    "received_cents, status, settled_date, outstanding_cents, pending_reasons, "
+    "receipt_flows) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+)
+
+
+def _history_values(batch_id: int, detail: dict[str, Any] | None,
+                    transfer_no: str) -> tuple[Any, ...]:
+    """批次版本行：detail 为 None 表示该划款在本批次后明细消失。"""
+    if detail is None:
+        return (batch_id, transfer_no, 0, None, None, None, None, None, None,
+                None, None, None, None, None)
+    d = _detail_row(detail, batch_id)
+    return (batch_id, d[0], 1, *d[1:12])
+
+
+def _detail_signature(detail: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        detail["payment_month"], detail["payment_date"], detail["payment_flow_no"],
+        detail["payment_revision"], detail["paid_cents"], detail["received_cents"],
+        detail["status"], detail["settled_date"], detail["outstanding_cents"],
+        detail["pending_reasons"], detail["receipt_flows"],
+    )
+
+
+def _row_signature(row: sqlite3.Row) -> tuple[Any, ...]:
+    return (
+        row["payment_month"], row["payment_date"], row["payment_flow_no"],
+        row["payment_revision"], row["paid_cents"], row["received_cents"],
+        row["status"], row["settled_date"], row["outstanding_cents"],
+        json.loads(row["pending_reasons"]), json.loads(row["receipt_flows"]),
+    )
+
+
+def _all_transfer_flows(conn: sqlite3.Connection,
+                        transfer_nos: Iterable[str]) -> dict[str, list[compute.Flow]]:
+    """读取指定划款的当前全部有效流水（不按月份截止）。"""
+    nos = sorted(set(transfer_nos))
+    if not nos:
+        return {}
+    out: dict[str, list[compute.Flow]] = {}
+    # 分批查询，避免 SQLite 变量上限
+    for i in range(0, len(nos), 500):
+        chunk = nos[i:i + 500]
+        marks = ",".join("?" for _ in chunk)
+        rows = conn.execute(
+            f"SELECT flow_no, revision, transfer_no, post_date, direction, "
+            f"amount_cents FROM flows WHERE is_active = 1 AND transfer_no IN ({marks})",
+            chunk,
+        ).fetchall()
+        for flow in compute.rows_to_flows(rows):
+            out.setdefault(flow.transfer_no, []).append(flow)
+    return out
+
+
+def refresh_timing_details(
+    conn: sqlite3.Connection,
+    transfer_nos: Iterable[str],
+    batch_id: int,
+) -> dict[str, Any]:
+    """按给定划款重算并写入明细，同时记录本批次的明细版本。
+
+    调用方须已在写事务中。只处理传入的划款：未变化的明细内容不会产生
+    新历史行，也不会改写 updated_batch_id 以外的内容。
+    """
+    nos = sorted(set(transfer_nos))
+    stats = {"recomputed": 0, "changed": 0, "removed": 0}
+    if not nos:
+        return stats
+
+    flows_by_transfer = _all_transfer_flows(conn, nos)
+    existing = {}
+    for i in range(0, len(nos), 500):
+        chunk = nos[i:i + 500]
+        marks = ",".join("?" for _ in chunk)
+        for row in conn.execute(
+            f"SELECT * FROM timing_details WHERE transfer_no IN ({marks})", chunk
+        ).fetchall():
+            existing[row["transfer_no"]] = row
+
+    history_rows: list[tuple[Any, ...]] = []
+    for transfer_no in nos:
+        new_detail = compute.timing_detail(
+            transfer_no, flows_by_transfer.get(transfer_no, [])
+        )
+        old = existing.get(transfer_no)
+        stats["recomputed"] += 1
+        if new_detail is None:
+            if old is not None:
+                conn.execute(
+                    "DELETE FROM timing_details WHERE transfer_no = ?", (transfer_no,)
+                )
+                history_rows.append(_history_values(batch_id, None, transfer_no))
+                stats["removed"] += 1
+            continue
+
+        if old is not None and _row_signature(old) == _detail_signature(new_detail):
+            # 内容未变：只推进版本指针，不追加历史
+            if old["updated_batch_id"] != batch_id:
+                conn.execute(
+                    "UPDATE timing_details SET updated_batch_id = ? "
+                    "WHERE transfer_no = ?",
+                    (batch_id, transfer_no),
+                )
+            continue
+
+        conn.execute("DELETE FROM timing_details WHERE transfer_no = ?", (transfer_no,))
+        conn.execute(_DETAIL_INSERT_SQL, _detail_row(new_detail, batch_id))
+        history_rows.append(_history_values(batch_id, new_detail, transfer_no))
+        stats["changed"] += 1
+
+    if history_rows:
+        conn.executemany(_HISTORY_INSERT_SQL, history_rows)
+    return stats
+
+
+def transfers_touched_by_batch(conn: sqlite3.Connection,
+                               batch_id: int) -> set[str]:
+    """某批次真正改变“有效流水”的划款号。
+
+    - 本批次新插入且生效的流水所属划款；
+    - 本批次顶替掉的旧有效流水所属划款（改归属时即原划款）。
+    乱序补报的低修订、重复重报都不会改变有效流水，不纳入重算。
+    """
+    rows = conn.execute(
+        "SELECT DISTINCT transfer_no FROM flows "
+        "WHERE batch_id = ? AND is_active = 1", (batch_id,)
+    ).fetchall()
+    touched = {r["transfer_no"] for r in rows}
+    old_rows = conn.execute(
+        "SELECT DISTINCT transfer_no FROM flows "
+        "WHERE superseded_by_batch = ? AND is_active = 0", (batch_id,)
+    ).fetchall()
+    touched |= {r["transfer_no"] for r in old_rows}
+    return touched
+
+
+def ensure_timing_details(conn: sqlite3.Connection) -> None:
+    """旧库升级：明细表为空时按当前有效流水一次性补齐。
+
+    补齐内容与流水版本同时落在最新批次下，使后续增量与分页版本可延续。
+    幂等：已记录版本标记时直接返回。
+    """
+    with transaction(conn):
+        version = conn.execute(
+            "SELECT value FROM app_meta WHERE key = 'timing_schema_version'"
+        ).fetchone()
+        if version is not None and version["value"] == TIMING_SCHEMA_VERSION:
+            return
+        count = conn.execute("SELECT COUNT(*) AS c FROM timing_details").fetchone()["c"]
+        batch_id = latest_batch_id(conn) or 0
+        if count == 0:
+            flows = compute.rows_to_flows(conn.execute(
+                "SELECT flow_no, revision, transfer_no, post_date, direction, "
+                "amount_cents FROM flows WHERE is_active = 1"
+            ).fetchall())
+            details = compute.compute_timing_details(flows)
+            conn.executemany(
+                _DETAIL_INSERT_SQL, [_detail_row(d, batch_id) for d in details]
+            )
+            # 补齐同时写入基线版本，保证此后任一既有批次都能据此重建明细
+            conn.executemany(
+                _HISTORY_INSERT_SQL,
+                [_history_values(batch_id, d, d["transfer_no"]) for d in details],
+            )
+        conn.execute(
+            "INSERT INTO app_meta(key, value) VALUES ('timing_schema_version', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (TIMING_SCHEMA_VERSION,),
+        )
+
+
+# ---------------- 分页读取明细 ----------------
+
+def timing_batch_bounds(conn: sqlite3.Connection) -> int | None:
+    """首页固定批次：当前最新已提交批次。空库返回 None。"""
+    return latest_batch_id(conn)
+
+
+def timing_page(
+    conn: sqlite3.Connection,
+    batch_id: int,
+    after_payment_date: str | None,
+    after_transfer_no: str | None,
+    limit: int,
+    payment_date_from: str | None = None,
+    payment_date_to: str | None = None,
+    payment_month: str | None = None,
+    status: str | None = None,
+) -> tuple[list[dict[str, Any]], bool, int]:
+    """按付款日、划款号读取某批次版本的明细页，返回（行, has_more, 总数）。
+
+    版本语义：每个划款取“batch_id 当时最新的一条历史行”；没有历史行的划款
+    （例如该批次未触及且明细在上次补齐后才创建）回落读取当前明细，但要求
+    其 updated_batch_id <= batch_id。
+    """
+    filter_params: list[Any] = []
+    filter_sql = ""
+    if payment_date_from is not None:
+        filter_sql += " AND payment_date >= ?"
+        filter_params.append(payment_date_from)
+    if payment_date_to is not None:
+        filter_sql += " AND payment_date <= ?"
+        filter_params.append(payment_date_to)
+    if payment_month is not None:
+        filter_sql += " AND payment_month = ?"
+        filter_params.append(payment_month)
+    if status is not None:
+        filter_sql += " AND status = ?"
+        filter_params.append(status)
+
+    cursor_sql = ""
+    cursor_params: list[Any] = []
+    if after_payment_date is not None and after_transfer_no is not None:
+        cursor_sql = (
+            " AND (payment_date > ? OR (payment_date = ? AND transfer_no > ?))"
+        )
+        cursor_params = [after_payment_date, after_payment_date, after_transfer_no]
+
+    base = f"""
+        WITH versioned AS (
+            SELECT h.transfer_no, h.is_present, h.payment_month, h.payment_date,
+                   h.payment_flow_no, h.payment_revision, h.paid_cents,
+                   h.received_cents, h.status, h.settled_date,
+                   h.outstanding_cents, h.pending_reasons, h.receipt_flows
+            FROM timing_detail_history h
+            JOIN (
+                SELECT transfer_no, MAX(batch_id) AS mb
+                FROM timing_detail_history WHERE batch_id <= ?
+                GROUP BY transfer_no
+            ) latest
+              ON h.transfer_no = latest.transfer_no AND h.batch_id = latest.mb
+            UNION ALL
+            SELECT t.transfer_no, 1, t.payment_month, t.payment_date,
+                   t.payment_flow_no, t.payment_revision, t.paid_cents,
+                   t.received_cents, t.status, t.settled_date,
+                   t.outstanding_cents, t.pending_reasons, t.receipt_flows
+            FROM timing_details t
+            WHERE t.updated_batch_id <= ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM timing_detail_history h
+                  WHERE h.transfer_no = t.transfer_no
+              )
+        )
+        SELECT * FROM versioned
+        WHERE is_present = 1 AND payment_date IS NOT NULL
+        {filter_sql}
+    """
+    fixed = [batch_id, batch_id] + filter_params
+    total = conn.execute(
+        f"SELECT COUNT(*) AS c FROM ({base})", fixed
+    ).fetchone()["c"]
+    rows = conn.execute(
+        f"{base} {cursor_sql} ORDER BY payment_date, transfer_no LIMIT ?",
+        fixed + cursor_params + [limit + 1],
+    ).fetchall()
+    has_more = len(rows) > limit
+    out = [{
+        "transfer_no": r["transfer_no"],
+        "payment_month": r["payment_month"],
+        "payment_date": r["payment_date"],
+        "payment_flow_no": r["payment_flow_no"],
+        "payment_revision": r["payment_revision"],
+        "paid_cents": r["paid_cents"],
+        "received_cents": r["received_cents"],
+        "status": r["status"],
+        "settled_date": r["settled_date"],
+        "outstanding_cents": r["outstanding_cents"],
+        "pending_reasons": json.loads(r["pending_reasons"]),
+        "receipt_flows": json.loads(r["receipt_flows"]),
+    } for r in rows[:limit]]
+    return out, has_more, total
 
 
 @contextmanager
@@ -236,12 +592,18 @@ def import_flows(conn: sqlite3.Connection, payload: list[dict[str, Any]]) -> dic
                 "outcome": "superseded" if replaced else "inserted",
             })
 
+        # 只重算本批次有效流水发生变化的划款；明细与流水同一事务提交
+        timing = refresh_timing_details(
+            conn, transfers_touched_by_batch(conn, batch_id), batch_id
+        )
+
         return {
             "batch_id": batch_id,
             "inserted": inserted,
             "superseded": superseded,
             "already_present": already,
             "rows": outcomes,
+            "timing": timing,
         }
 
 

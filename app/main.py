@@ -1,6 +1,10 @@
-"""FastAPI 路由：录入、重算、封存、对照。"""
+"""FastAPI 路由：录入、重算、封存、对照、到账时效明细分页。"""
 from __future__ import annotations
 
+import base64
+import binascii
+import json
+import re
 from datetime import date
 from typing import Any
 
@@ -24,6 +28,9 @@ from .schemas import (
     PositionChange,
     SealResponse,
     SealedPaperMeta,
+    TimingDetail,
+    TimingImportStats,
+    TimingPage,
 )
 
 @asynccontextmanager
@@ -40,9 +47,11 @@ app = FastAPI(
         "- 同流水号取最高修订号；同号同修订内容冲突整批退回\n"
         "- 两次核算均只取入账日不晚于月底的记录\n"
         "- 缺付款/超额到账/重复付款的划款单列为待核\n"
-        "- 封存与对照各自在一个只读快照内完成，只取同一次已提交数据"
+        "- 封存与对照各自在一个只读快照内完成，只取同一次已提交数据\n"
+        "- `/timing-details` 按付款月分页复核到账时效，明细分批次维护，"
+        "游标固定轮次、可跨重启续读"
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -82,6 +91,7 @@ def import_flows(req: ImportRequest, conn=Depends(get_conn)) -> ImportResponse:
         superseded=result["superseded"],
         already_present=result["already_present"],
         rows=result["rows"],
+        timing=TimingImportStats(**result["timing"]),
     )
 
 
@@ -255,6 +265,155 @@ def compare(paper_id: int, conn=Depends(get_conn)) -> CompareResponse:
             sealed=sealed_resp,
             recomputed=current_resp,
         )
+
+
+@app.get(
+    "/timing-details",
+    response_model=TimingPage,
+    tags=["到账时效"],
+    summary="按付款月分页复核到账时效明细",
+    description=(
+        "按付款日、划款号排序列出“恰好一笔有效付款”的划款，附付款/到账流水号与修订号。\n\n"
+        "- 到账合计 > 付款额，或到账早于付款日：`pending` 待核；\n"
+        "- 到账合计 = 付款额：`settled`，结清日取最后到账日；\n"
+        "- 到账合计 < 付款额：`outstanding`，给出未到账金额。\n\n"
+        "直接读取已维护的明细。首页返回 `as_of` 与 `next_cursor`；续页只需回传 `cursor`，"
+        "游标已固定本轮的批次与筛选口径，重试或服务重启后仍沿原结果续读。"
+    ),
+)
+def timing_details(
+    as_of: int | None = Query(
+        None, description="固定批次：首页返回的 as_of，续页原样回传；省略则取当前最新批次"
+    ),
+    cursor: str | None = Query(
+        None, description="上一页返回的 next_cursor；与 as_of 配套使用"
+    ),
+    page_size: int = Query(50, ge=1, le=500, description="每页条数"),
+    payment_date_from: date | None = Query(None, description="付款日起（含）"),
+    payment_date_to: date | None = Query(None, description="付款日止（含）"),
+    payment_month: str | None = Query(None, pattern=r"^\d{4}-\d{2}$",
+                                      description="付款月 YYYY-MM"),
+    status: str | None = Query(None, pattern=r"^(pending|settled|outstanding)$",
+                               description="结论：pending 待核 / settled 已结清 / outstanding 未足额"),
+    conn=Depends(get_conn),
+) -> TimingPage:
+    """按付款日、划款号分页列出到账时效明细。
+
+    直接读取已维护的明细；同一轮固定在首页所见的批次（as_of），
+    重试或重启后仍按该批次续读原结果，不受后续录入影响。
+    """
+    with db.snapshot(conn):
+        latest = db.timing_batch_bounds(conn)
+
+        # 先解析游标：游标自带首页固定的批次与筛选口径，续页只要回传 cursor 即可
+        after_date = after_transfer = None
+        cursor_as_of: int | None = None
+        cursor_filters: dict[str, Any] = {}
+        if cursor is not None:
+            try:
+                decoded = json.loads(
+                    base64.urlsafe_b64decode(cursor.encode()).decode()
+                )
+                after_date = decoded["payment_date"]
+                after_transfer = decoded["transfer_no"]
+                cursor_as_of = int(decoded["as_of"])
+                cursor_filters = decoded.get("filters") or {}
+                date.fromisoformat(after_date)  # 校验日期格式，非法会抛 ValueError
+                if not after_transfer or cursor_as_of < 1:
+                    raise ValueError("bad cursor")
+                if not isinstance(cursor_filters, dict):
+                    raise ValueError("bad filters")
+            except (binascii.Error, UnicodeDecodeError, KeyError,
+                    TypeError, ValueError, json.JSONDecodeError):
+                raise HTTPException(status_code=400, detail="cursor 无效")
+
+        if as_of is not None and cursor_as_of is not None and as_of != cursor_as_of:
+            raise HTTPException(
+                status_code=409,
+                detail=f"as_of={as_of} 与游标所属批次 {cursor_as_of} 不一致",
+            )
+        requested_as_of = as_of if as_of is not None else cursor_as_of
+
+        # 显式传入的筛选必须与首页一致；未传则沿用游标里的口径
+        explicit = {
+            "payment_date_from": payment_date_from.isoformat() if payment_date_from else None,
+            "payment_date_to": payment_date_to.isoformat() if payment_date_to else None,
+            "payment_month": payment_month,
+            "status": status,
+        }
+        if cursor is not None:
+            for key, value in explicit.items():
+                expected = cursor_filters.get(key)
+                if value is not None and value != expected:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"筛选参数 {key}={value} 与游标所属轮次 {expected} 不一致",
+                    )
+                if value is None:
+                    explicit[key] = expected
+            # 游标来自客户端，回填的筛选值需重新校验，防止伪造游标引发 500
+            if explicit["status"] not in (None, "pending", "settled", "outstanding"):
+                raise HTTPException(status_code=400, detail="cursor 中的 status 无效")
+            if explicit["payment_month"] is not None and not re.fullmatch(
+                r"\d{4}-\d{2}", str(explicit["payment_month"])
+            ):
+                raise HTTPException(status_code=400, detail="cursor 中的 payment_month 无效")
+            for key in ("payment_date_from", "payment_date_to"):
+                if explicit[key] is not None:
+                    try:
+                        date.fromisoformat(str(explicit[key]))
+                    except (TypeError, ValueError):
+                        raise HTTPException(
+                            status_code=400, detail=f"cursor 中的 {key} 无效"
+                        )
+        payment_date_from_s = explicit["payment_date_from"]
+        payment_date_to_s = explicit["payment_date_to"]
+        payment_month_s = explicit["payment_month"]
+        status_s = explicit["status"]
+
+        if latest is None:
+            if requested_as_of is not None:
+                raise HTTPException(status_code=409, detail="库中还没有任何录入批次")
+            return TimingPage(
+                batch_id=0, as_of=0,
+                payment_date_from=payment_date_from,
+                payment_date_to=payment_date_to,
+                payment_month=payment_month, status=status,
+                items=[], has_more=False, next_cursor=None, total_count=0,
+            )
+        if requested_as_of is not None and (
+            requested_as_of < 1 or requested_as_of > latest
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=f"as_of={requested_as_of} 不是有效批次；当前可用范围为 1..{latest}",
+            )
+        fixed = requested_as_of if requested_as_of is not None else latest
+
+        rows, has_more, total = db.timing_page(
+            conn, fixed, after_date, after_transfer, page_size,
+            payment_date_from=payment_date_from_s,
+            payment_date_to=payment_date_to_s,
+            payment_month=payment_month_s, status=status_s,
+        )
+
+    next_cursor = None
+    if has_more and rows:
+        next_cursor = base64.urlsafe_b64encode(json.dumps({
+            "as_of": fixed,
+            "payment_date": rows[-1]["payment_date"],
+            "transfer_no": rows[-1]["transfer_no"],
+            "filters": explicit,
+        }, ensure_ascii=False).encode()).decode()
+
+    return TimingPage(
+        batch_id=fixed, as_of=fixed,
+        payment_date_from=explicit["payment_date_from"],
+        payment_date_to=explicit["payment_date_to"],
+        payment_month=explicit["payment_month"], status=explicit["status"],
+        items=[TimingDetail(**r) for r in rows],
+        has_more=has_more, next_cursor=next_cursor, total_count=total,
+    )
 
 
 @app.get("/", include_in_schema=False)

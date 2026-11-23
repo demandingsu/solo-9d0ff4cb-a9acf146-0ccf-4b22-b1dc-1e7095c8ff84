@@ -7,6 +7,12 @@
   在途余额 = 付款合计 - 截至月底到账合计；
 - 缺付款（只有到账没有付款）、超额到账（到账 > 付款）、
   重复付款（同一划款号出现多笔付款）的划款单列为待核。
+
+到账时效明细（按付款月复核）：
+- 只列“恰好一笔有效付款”的划款；
+- 到账合计 > 付款额，或任一到账日早于付款日，标为待核；
+- 其余：到账合计 = 付款额时以最后到账日为结清日，
+  未足额时给出未到账金额。
 """
 from __future__ import annotations
 
@@ -22,6 +28,14 @@ OVER_RECEIVED = "over_received"
 DUPLICATE_PAYMENT = "duplicate_payment"
 
 PENDING_STATUSES = {MISSING_PAYMENT, OVER_RECEIVED, DUPLICATE_PAYMENT}
+
+# 到账时效明细的结论
+TIMING_PENDING = "pending"          # 待核：超额到账 / 到账早于付款日
+TIMING_SETTLED = "settled"          # 已结清：到账合计 = 付款额
+TIMING_OUTSTANDING = "outstanding"  # 未足额：列未到账金额
+
+TIMING_OVER_RECEIVED = "over_received"
+TIMING_RECEIVED_BEFORE_PAYMENT = "received_before_payment"
 
 
 @dataclass(frozen=True)
@@ -128,6 +142,80 @@ def summarize(positions: list[dict[str, Any]]) -> tuple[int, list[dict[str, Any]
     total = sum(p["in_transit_cents"] for p in positions)
     pending = [p for p in positions if p["status"] in PENDING_STATUSES]
     return total, pending
+
+
+# ---------------- 到账时效明细（按付款月复核） ----------------
+
+def timing_detail(transfer_no: str, items: list[Flow]) -> dict[str, Any] | None:
+    """单个划款的到账时效明细；不是“恰好一笔有效付款”则返回 None。
+
+    只有一笔付款的划款才纳入复核。到账流水不按月底截止：
+    结清日与到账时效按当前全部有效到账记录判断。
+    """
+    pays = [f for f in items if f.direction == PAY]
+    if len(pays) != 1:
+        return None
+    pay = pays[0]
+    receipts = sorted(
+        (f for f in items if f.direction == RECEIVE),
+        key=lambda f: (f.post_date, f.flow_no),
+    )
+    received = sum(f.amount_cents for f in receipts)
+    reasons: list[str] = []
+    if received > pay.amount_cents:
+        reasons.append(TIMING_OVER_RECEIVED)
+    if any(f.post_date < pay.post_date for f in receipts):
+        reasons.append(TIMING_RECEIVED_BEFORE_PAYMENT)
+
+    if reasons:
+        status = TIMING_PENDING
+        settled_date: date | None = None
+        outstanding: int | None = None
+    elif received == pay.amount_cents:
+        status = TIMING_SETTLED
+        settled_date = receipts[-1].post_date if receipts else pay.post_date
+        outstanding = 0
+    else:
+        status = TIMING_OUTSTANDING
+        settled_date = None
+        outstanding = pay.amount_cents - received
+
+    return {
+        "transfer_no": transfer_no,
+        "payment_month": pay.post_date.strftime("%Y-%m"),
+        "payment_date": pay.post_date.isoformat(),
+        "payment_flow_no": pay.flow_no,
+        "payment_revision": pay.revision,
+        "paid_cents": pay.amount_cents,
+        "received_cents": received,
+        "status": status,
+        "settled_date": settled_date.isoformat() if settled_date else None,
+        "outstanding_cents": outstanding,
+        "pending_reasons": reasons,
+        "receipt_flows": [
+            {
+                "flow_no": f.flow_no,
+                "revision": f.revision,
+                "post_date": f.post_date.isoformat(),
+                "amount_cents": f.amount_cents,
+            }
+            for f in receipts
+        ],
+    }
+
+
+def compute_timing_details(flows: Iterable[Flow]) -> list[dict[str, Any]]:
+    """按当前有效流水生成全部到账时效明细（仅含恰好一笔付款的划款）。"""
+    grouped: dict[str, list[Flow]] = {}
+    for f in effective_flows(flows):
+        grouped.setdefault(f.transfer_no, []).append(f)
+    details: list[dict[str, Any]] = []
+    for transfer_no in sorted(grouped):
+        detail = timing_detail(transfer_no, grouped[transfer_no])
+        if detail is not None:
+            details.append(detail)
+    details.sort(key=lambda d: (d["payment_date"], d["transfer_no"]))
+    return details
 
 
 def diff_positions(

@@ -50,6 +50,10 @@ class ImportResponse(BaseModel):
     superseded: int
     already_present: int
     rows: list[ImportedRow]
+    timing: "TimingImportStats" = Field(
+        default_factory=lambda: TimingImportStats(),
+        description="本批对到账时效明细的维护结果",
+    )
 
 
 class FlowRow(BaseModel):
@@ -142,3 +146,57 @@ class Health(BaseModel):
     status: str
     db_path: str
     latest_batch_id: Optional[int] = None
+
+
+# ---------------- 到账时效明细（按付款月复核、分页） ----------------
+
+class ReceiptFlow(BaseModel):
+    flow_no: str
+    revision: int
+    post_date: date
+    amount_cents: int
+
+
+class TimingDetail(BaseModel):
+    """单个划款（恰好一笔有效付款）的到账时效明细。"""
+    transfer_no: str
+    payment_month: str = Field(..., description="付款月 YYYY-MM")
+    payment_date: date
+    payment_flow_no: str = Field(..., description="付款流水号")
+    payment_revision: int = Field(..., description="付款流水修订号")
+    paid_cents: int
+    received_cents: int
+    status: Literal["pending", "settled", "outstanding"]
+    settled_date: Optional[date] = Field(None, description="结清日：到账合计等于付款额时的最后到账日")
+    outstanding_cents: Optional[int] = Field(None, description="未到账金额；结清或待核时为 null/0")
+    pending_reasons: list[Literal["over_received", "received_before_payment"]] = Field(
+        default_factory=list,
+        description="待核原因：超额到账 / 到账早于付款日",
+    )
+    receipt_flows: list[ReceiptFlow] = Field(
+        default_factory=list, description="本划款当前有效到账流水（含流水号与修订号）"
+    )
+
+
+class TimingImportStats(BaseModel):
+    recomputed: int = Field(0, description="本批重算的划款数")
+    changed: int = Field(0, description="明细内容发生变化的划款数")
+    removed: int = Field(0, description="明细被移除的划款数")
+
+
+class TimingPage(BaseModel):
+    batch_id: int = Field(..., description="本页固定读取的明细版本批次")
+    as_of: int = Field(..., description="本轮固定在首页所见的批次，续页请原样回传")
+    payment_date_from: Optional[date] = Field(None, description="付款日起（含）")
+    payment_date_to: Optional[date] = Field(None, description="付款日止（含）")
+    payment_month: Optional[str] = Field(None, description="付款月筛选 YYYY-MM")
+    status: Optional[Literal["pending", "settled", "outstanding"]] = Field(
+        None, description="结论筛选：待核 / 已结清 / 未足额"
+    )
+    items: list[TimingDetail]
+    has_more: bool
+    next_cursor: Optional[str] = Field(None, description="下一页游标；为空表示已到末页")
+    total_count: int = Field(..., description="本轮固定版本下符合条件的总条数")
+
+
+ImportResponse.model_rebuild()

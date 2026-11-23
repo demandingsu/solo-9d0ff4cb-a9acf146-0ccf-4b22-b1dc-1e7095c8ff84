@@ -1,7 +1,7 @@
 services:
   transit-api:
     build: .
-    image: transit-fund-api:1.0.0
+    image: transit-fund-api:1.1.0
     container_name: transit-fund-api
     ports:
       - "8000:8000"
