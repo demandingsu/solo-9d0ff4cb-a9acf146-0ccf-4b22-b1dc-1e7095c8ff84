@@ -1,0 +1,15 @@
+services:
+  transit-api:
+    build: .
+    image: transit-fund-api:1.0.0
+    container_name: transit-fund-api
+    ports:
+      - "8000:8000"
+    environment:
+      TRANSIT_DB_PATH: /data/transit.db
+    volumes:
+      - transit-data:/data
+    restart: unless-stopped
+
+volumes:
+  transit-data:
